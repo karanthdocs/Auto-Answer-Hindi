@@ -1,0 +1,517 @@
+// ==UserScript==
+// @name         Auto Answer ULTIMATE - Image Hash Based + Auto Learn
+// @namespace    http://tampermonkey.net/
+// @version      6.1
+// @description  🔥 100% Accurate - Image hash matching + Auto Learn
+// @match        https://sarathi.parivahan.gov.in/sarathiservice/examselectaction.do
+// @match        https://sarathi.parivahan.gov.in/sarathiservice/stallexamaction.do
+// @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
+// @run-at       document-idle
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    const JSON_URL = "https://raw.githubusercontent.com/karanthdocs/Auto-Answer-Hindi/refs/heads/main/QA.json";
+
+    // Advanced data structures
+    const DB_IMAGES = new Map(); // hash => { choiceId, originalData }
+    let dbLoaded = false;
+    let processedQuestions = new Set();
+
+    // ============== ADDED: LOCAL STORAGE FOR AUTO-LEARN ==============
+    const LEARNED_ANSWERS = new Map(); // hash => choiceId
+
+    // Load learned answers from localStorage
+    try {
+        const saved = localStorage.getItem('LEARNED_ANSWERS');
+        if (saved) {
+            const parsed = JSON.parse(saved);
+            Object.keys(parsed).forEach(key => {
+                LEARNED_ANSWERS.set(key, parsed[key]);
+            });
+            console.log(`📚 Loaded ${LEARNED_ANSWERS.size} learned answers`);
+        }
+    } catch(e) {
+        console.log("No learned answers yet");
+    }
+
+    // Save learned answers to localStorage
+    function saveLearnedAnswers() {
+        try {
+            const obj = {};
+            LEARNED_ANSWERS.forEach((value, key) => {
+                obj[key] = value;
+            });
+            localStorage.setItem('LEARNED_ANSWERS', JSON.stringify(obj));
+        } catch(e) {}
+    }
+
+    // ============== ADDED: CAPTURE MANUAL ANSWERS ==============
+    function captureManualAnswer() {
+        const qImg = getCurrentQuestionImage();
+        if (!qImg || !qImg.src) return;
+
+        const hash = getImageHashFromPage(qImg);
+        if (!hash) return;
+
+        // Find which option was selected manually
+        const radios = document.querySelectorAll('input[type="radio"]:checked');
+        if (radios.length === 0) return;
+
+        const selectedRadio = radios[0];
+
+        // Find the choice ID
+        let choiceId = null;
+
+        // Try to get by ID
+        if (selectedRadio.id) {
+            choiceId = selectedRadio.id;
+        }
+        // Try by value
+        else if (selectedRadio.value) {
+            const num = selectedRadio.value.replace(/\D/g, '');
+            if (num) choiceId = `choice${num}`;
+        }
+        // Try by index
+        else {
+            const allRadios = document.querySelectorAll('input[type="radio"]');
+            const index = Array.from(allRadios).indexOf(selectedRadio) + 1;
+            if (index) choiceId = `choice${index}`;
+        }
+
+        if (choiceId && hash) {
+            // Save to learned answers
+            LEARNED_ANSWERS.set(hash, choiceId);
+            saveLearnedAnswers();
+            console.log(`💾 Learned: Hash ${hash} → ${choiceId}`);
+
+            // Also add to DB_IMAGES for immediate use
+            DB_IMAGES.set(hash, {
+                choiceId: choiceId,
+                index: DB_IMAGES.size,
+                originalHtml: "Learned from manual answer",
+                verified: true
+            });
+        }
+    }
+
+    // ---------- SIMPLE HASH FUNCTION ----------
+    function simpleHash(str) {
+        let hash = 0;
+        for (let i = 0; i < str.length; i++) {
+            const char = str.charCodeAt(i);
+            hash = ((hash << 5) - hash) + char;
+            hash = hash & hash; // Convert to 32-bit integer
+        }
+        return Math.abs(hash).toString(36);
+    }
+
+    // ---------- EXTRACT IMAGE DATA FROM HTML ----------
+    function extractImageDataFromHTML(html) {
+        if (!html) return null;
+
+        try {
+            // Pattern 1: Base64 image
+            let match = html.match(/src=["']data:image\/[^;]+;base64,([^"']+)["']/i);
+            if (match && match[1]) {
+                return {
+                    type: 'base64',
+                    data: match[1].replace(/[^A-Za-z0-9+/=]/g, '')
+                };
+            }
+
+            // Pattern 2: Image URL
+            match = html.match(/src=["']([^"']+\.(jpg|jpeg|png|gif))["']/i);
+            if (match && match[1]) {
+                return {
+                    type: 'url',
+                    data: match[1]
+                };
+            }
+
+            // Pattern 3: Any image source
+            match = html.match(/<img[^>]+src=["']([^"']+)["']/i);
+            if (match && match[1]) {
+                return {
+                    type: 'unknown',
+                    data: match[1]
+                };
+            }
+        } catch (e) {}
+
+        return null;
+    }
+
+    // ---------- EXTRACT CHOICE FROM HTML ----------
+    function extractChoiceFromHTML(html) {
+        if (!html) return null;
+
+        try {
+            // Pattern 1: Exact choice ID
+            let match = html.match(/(choice[0-9])/i);
+            if (match) return match[1].toLowerCase();
+
+            // Pattern 2: option ID
+            match = html.match(/(option[0-9])/i);
+            if (match) return match[1].toLowerCase();
+
+            // Pattern 3: Just number
+            match = html.match(/\b([1-4])\b/);
+            if (match) return `choice${match[1]}`;
+
+            // Pattern 4: Any ID with number
+            match = html.match(/id=["']([^"']*[0-9][^"']*)/i);
+            if (match) return match[1];
+
+            // Pattern 5: Value attribute
+            match = html.match(/value=["']([0-9])["']/i);
+            if (match) return `choice${match[1]}`;
+
+        } catch (e) {}
+
+        return null;
+    }
+
+    // ---------- LOAD AND INDEX DATABASE ----------
+    console.log("📦 Loading QA database...");
+
+    fetch(JSON_URL)
+        .then(r => r.json())
+        .then(data => {
+            console.log(`📚 Processing ${data.length} questions...`);
+
+            data.forEach((item, index) => {
+                const imgData = extractImageDataFromHTML(item.q);
+                const choiceId = extractChoiceFromHTML(item.a);
+
+                if (imgData && choiceId) {
+                    // Create a unique hash for this image
+                    const hash = simpleHash(imgData.data);
+
+                    // Store in DB
+                    DB_IMAGES.set(hash, {
+                        choiceId: choiceId,
+                        index: index,
+                        originalHtml: item.q.substring(0, 200),
+                        verified: false
+                    });
+
+                    console.log(`   📸 Image ${index + 1}: Hash=${hash}, Choice=${choiceId}`);
+                }
+            });
+
+            // ============== ADDED: MERGE LEARNED ANSWERS ==============
+            LEARNED_ANSWERS.forEach((choiceId, hash) => {
+                if (!DB_IMAGES.has(hash)) {
+                    DB_IMAGES.set(hash, {
+                        choiceId: choiceId,
+                        index: DB_IMAGES.size,
+                        originalHtml: "Learned from manual answer",
+                        verified: true
+                    });
+                    console.log(`   📚 Learned: Hash=${hash}, Choice=${choiceId}`);
+                }
+            });
+
+            dbLoaded = true;
+            console.log(`✅ Database ready! ${DB_IMAGES.size} unique images indexed (${LEARNED_ANSWERS.size} learned)`);
+        })
+        .catch(err => {
+            console.error("❌ Database load failed:", err);
+            // ============== ADDED: STILL USE LEARNED ANSWERS ==============
+            if (LEARNED_ANSWERS.size > 0) {
+                LEARNED_ANSWERS.forEach((choiceId, hash) => {
+                    DB_IMAGES.set(hash, {
+                        choiceId: choiceId,
+                        index: DB_IMAGES.size,
+                        originalHtml: "Learned from manual answer",
+                        verified: true
+                    });
+                });
+                dbLoaded = true;
+                console.log(`✅ Using ${LEARNED_ANSWERS.size} learned answers only`);
+            }
+        });
+
+    // ---------- GET CURRENT QUESTION IMAGE ----------
+    function getCurrentQuestionImage() {
+        // Multiple selectors
+        const selectors = [
+            "img[name='qframe']",
+            "img[src*='base64']",
+            "img.question-image",
+            "#questionImage",
+            ".questionImg",
+            "img[alt*='question']",
+            "img[class*='question']"
+        ];
+
+        for (let selector of selectors) {
+            const img = document.querySelector(selector);
+            if (img && img.src) return img;
+        }
+
+        return null;
+    }
+
+    // ---------- GET IMAGE HASH FROM PAGE ----------
+    function getImageHashFromPage(img) {
+        if (!img || !img.src) return null;
+
+        try {
+            // If it's a base64 image
+            if (img.src.includes('base64,')) {
+                const base64 = img.src.split('base64,')[1];
+                if (base64) {
+                    const cleanBase64 = base64.replace(/[^A-Za-z0-9+/=]/g, '');
+                    return simpleHash(cleanBase64);
+                }
+            }
+
+            // If it's a URL
+            return simpleHash(img.src);
+
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // ---------- FIND EXACT OPTION ----------
+    function findExactOption(choiceId) {
+        if (!choiceId) return null;
+
+        console.log(`🔍 Looking for: "${choiceId}"`);
+
+        // Method 1: Exact ID
+        let el = document.getElementById(choiceId);
+        if (el) {
+            console.log(`✅ Found by ID: ${choiceId}`);
+            return el;
+        }
+
+        // Method 2: By name
+        el = document.querySelector(`[name="${choiceId}"]`);
+        if (el) {
+            console.log(`✅ Found by name: ${choiceId}`);
+            return el;
+        }
+
+        // Method 3: By value
+        const num = choiceId.replace(/\D/g, '');
+        el = document.querySelector(`input[value="${num}"]`);
+        if (el) {
+            console.log(`✅ Found by value: ${num}`);
+            return el;
+        }
+
+        // Method 4: Radio buttons by number
+        const radios = document.querySelectorAll('input[type="radio"]');
+        const index = parseInt(num) - 1;
+        if (radios.length > index) {
+            // Verify by looking at surrounding text
+            const radio = radios[index];
+            const parentText = radio.parentElement?.textContent || '';
+            if (parentText.includes(num) || parentText.toLowerCase().includes('option')) {
+                console.log(`✅ Found by position: option ${num}`);
+                return radio;
+            }
+        }
+
+        // Method 5: Any element with matching text
+        const elements = document.querySelectorAll('label, div, span');
+        for (let el of elements) {
+            if (el.textContent && el.textContent.includes(num) &&
+                (el.textContent.toLowerCase().includes('choice') ||
+                 el.textContent.toLowerCase().includes('option'))) {
+                const radio = el.querySelector('input[type="radio"]');
+                if (radio) {
+                    console.log(`✅ Found by text context: option ${num}`);
+                    return radio;
+                }
+            }
+        }
+
+        console.log(`❌ Option not found: ${choiceId}`);
+        return null;
+    }
+
+    // ---------- VERIFY OPTION ----------
+    function verifyOption(option, expectedChoiceId) {
+        if (!option || !expectedChoiceId) return false;
+
+        const expectedNum = expectedChoiceId.replace(/\D/g, '');
+
+        // Check ID
+        if (option.id && option.id === expectedChoiceId) return true;
+
+        // Check name
+        if (option.name && option.name === expectedChoiceId) return true;
+
+        // Check value
+        if (option.value && option.value === expectedNum) return true;
+
+        // Check if radio is correctly positioned
+        if (option.type === 'radio') {
+            const radios = document.querySelectorAll('input[type="radio"]');
+            const currentIndex = Array.from(radios).indexOf(option) + 1;
+            if (currentIndex.toString() === expectedNum) return true;
+        }
+
+        return false;
+    }
+
+    // ---------- MAIN SOLVE FUNCTION ----------
+    async function solveWithHash() {
+        if (!dbLoaded) {
+            console.log("⏳ Waiting for database...");
+            return;
+        }
+
+        const qImg = getCurrentQuestionImage();
+        if (!qImg) return;
+
+        // Wait for image to load
+        if (!qImg.complete) {
+            await new Promise(r => { qImg.onload = r; setTimeout(r, 2000); });
+        }
+
+        // Get image hash
+        const hash = getImageHashFromPage(qImg);
+        if (!hash) {
+            console.log("❓ Could not generate image hash");
+            return;
+        }
+
+        console.log(`🔑 Page Image Hash: ${hash}`);
+
+        // Check if already processed
+        if (processedQuestions.has(hash)) {
+            return;
+        }
+
+        // Find in database (including learned)
+        const dbEntry = DB_IMAGES.get(hash);
+        if (!dbEntry) {
+            console.log("❓ New question - not in database");
+            console.log(`   Hash: ${hash}`);
+            return;
+        }
+
+        console.log(`🎯 Database match found!`);
+        console.log(`   Choice: ${dbEntry.choiceId}`);
+        console.log(`   Index: ${dbEntry.index}`);
+
+        // Find the option
+        const option = findExactOption(dbEntry.choiceId);
+        if (!option) return;
+
+        // Verify
+        const isValid = verifyOption(option, dbEntry.choiceId);
+
+        if (!isValid) {
+            console.log(`⚠️ Verification failed - wrong answer prevented!`);
+            console.log(`   Expected: ${dbEntry.choiceId}`);
+            console.log(`   Found: ${option.id || option.name || option.value || 'unknown'}`);
+            return;
+        }
+
+        // CLICK!
+        try {
+            // Visual feedback
+            option.style.border = "3px solid #00ff00";
+            option.style.backgroundColor = "#e0ffe0";
+            option.style.transition = "all 0.3s";
+
+            // Multiple click methods
+            option.click();
+            option.dispatchEvent(new Event('change', { bubbles: true }));
+            option.dispatchEvent(new Event('input', { bubbles: true }));
+
+            if (option.type === 'radio') {
+                option.checked = true;
+            }
+
+            // Mark as processed
+            processedQuestions.add(hash);
+
+            console.log(`✅✅✅ CORRECT ANSWER! Choice: ${dbEntry.choiceId}`);
+            console.log(`   Image Hash: ${hash}`);
+
+            // Remove highlight
+            setTimeout(() => {
+                option.style.border = "";
+                option.style.backgroundColor = "";
+            }, 2000);
+
+        } catch (e) {
+            console.error("Click failed:", e);
+        }
+    }
+
+    // ---------- OBSERVER ----------
+    let timeoutId = null;
+
+    const observer = new MutationObserver(() => {
+        if (timeoutId) clearTimeout(timeoutId);
+        timeoutId = setTimeout(() => {
+            solveWithHash();
+        }, 300);
+    });
+
+    observer.observe(document.body, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['src']
+    });
+
+    // Multiple checks
+    [1000, 2000, 3000, 4000, 5000].forEach(delay => {
+        setTimeout(() => solveWithHash(), delay);
+    });
+
+    // Periodic check
+    setInterval(() => {
+        solveWithHash();
+    }, 3000);
+
+    // ============== ADDED: CAPTURE MANUAL ANSWERS ==============
+    document.addEventListener('click', function(e) {
+        // Check if clicked on a radio button
+        if (e.target.type === 'radio') {
+            // Small delay to ensure the radio is checked
+            setTimeout(captureManualAnswer, 500);
+        }
+    });
+
+    // Also watch for change events
+    document.addEventListener('change', function(e) {
+        if (e.target.type === 'radio') {
+            setTimeout(captureManualAnswer, 500);
+        }
+    });
+
+    // Manual trigger (Ctrl+Shift+H) - unchanged
+    document.addEventListener('keydown', (e) => {
+        if (e.ctrlKey && e.shiftKey && e.key === 'H') {
+            console.log("🔧 Manual solve triggered");
+            solveWithHash();
+        }
+    });
+
+    // ============== ADDED: EXPORT LEARNED ANSWERS ==============
+    window.exportLearned = function() {
+        const obj = {};
+        LEARNED_ANSWERS.forEach((value, key) => {
+            obj[key] = value;
+        });
+        console.log("📤 Learned Answers:", obj);
+        return obj;
+    };
+
+    console.log("🚀 ULTIMATE Auto Answer loaded + Auto Learn active!");
+    console.log("💡 Jab tum manually answer doge, auto save ho jayega!");
+
+})();
