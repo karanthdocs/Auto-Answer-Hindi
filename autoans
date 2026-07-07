@@ -13,7 +13,7 @@
 (function() {
     'use strict';
 
-    const JSON_URL = "https://raw.githubusercontent.com/karanthdocs/Auto-Answer-Hindi/refs/heads/main/QAeng.json";
+    const JSON_URL = "https://raw.githubusercontent.com/karanthdocs/LLRAUTOCODE/refs/heads/main/QAHINDI.json";
 
     // Advanced data structures
     const DB_IMAGES = new Map(); // hash => { choiceId, originalData }
